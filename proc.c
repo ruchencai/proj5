@@ -247,7 +247,7 @@ exit(void)
   for (int i = 0; i < NMMAP; i++) {
     if (curproc->mmaps[i].valid) {
       // unmap if valid
-      munmap(curproc->mmaps[i].va, curproc->mmaps[i].length);
+      do_munmap(curproc, curproc->mmaps[i].va, curproc->mmaps[i].length);
       curproc->mmaps[i].valid = 0;
     }
   }

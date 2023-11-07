@@ -78,13 +78,75 @@ get_va_free(struct mmapinfo *mmaps, int length, void **start_addr, void **end_ad
   return 0;
 }
 
-// get file from fd
-struct file* get_file(struct proc *p, int fd) {
-  if (fd < 0 || fd >= NOFILE || p->ofile[fd] == 0) {
-    return 0;
+// file-backed mapping
+int file_backed_mmap(struct proc *p, struct file *f, uint addr, int offset, int prot) {
+  int remaining_size = f->ip->size - offset;  // Remaining size should consider the offset
+  
+  // Allocate in the unit of pages
+  for (int i = 0; i < remaining_size; i += PGSIZE) {
+    // Calculate the size to map for this iteration
+    int map_size = (remaining_size - i > PGSIZE) ? PGSIZE : (remaining_size - i);
+
+    // Allocate a page and clear it
+    char *tmp = kalloc();
+    if (!tmp)
+      return -1;  
+    memset(tmp, 0, PGSIZE);
+
+    // Copy file content into the allocated page
+    ilock(f->ip);  // Lock the inode before accessing the file
+
+    int read_size = map_size;  // Amount of file content to read into the page
+    int bytes_read = readi(f->ip, tmp, offset + i, read_size);  
+    if (bytes_read < 0) {
+      iunlock(f->ip);
+      kfree(tmp);  
+      return -1;
+    }
+
+    iunlock(f->ip);  
+
+    // Map the page into the user proc
+    if (mappages(p->pgdir, (void *)(addr + i), PGSIZE, V2P(tmp), prot) < 0) {
+      kfree(tmp); 
+      return -1;
+    }
+
+    remaining_size -= map_size;
   }
-  return p->ofile[fd];
+
+  return 0;  
 }
+
+int file_backed_private_mmap(struct proc *p, struct file *f, uint addr, int offset, int prot) {
+    // Assume 'size' is the length to be mapped
+    int size = f->ip->size - offset;  
+    if (size <= 0) return -1;
+
+    // Iterate over the file in page-sized chunks
+    for (int i = 0; i < size; i += PGSIZE) {
+        char *mem = kalloc();  // Allocate a new page
+        if (!mem) return -1;  // Allocation failed
+
+        memset(mem, 0, PGSIZE);
+        ilock(f->ip);
+        int read_bytes = readi(f->ip, mem, offset + i, PGSIZE);
+        iunlock(f->ip);
+
+        if (read_bytes < 0) {
+            kfree(mem);  // Read failed, free allocated memory
+            return -1;
+        }
+
+        if (mappages(p->pgdir, (void *)(addr + i), PGSIZE, V2P(mem), prot) < 0) {
+            kfree(mem);  // Mapping failed, free allocated memory
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// TODO: implement copy_map function to copy from parent to child here. only call this function in fork
 	
 
 // void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
@@ -133,6 +195,8 @@ sys_mmap(void) {
 
   void *vstart = va;
   void *vend = va + PGROUNDUP(length);
+
+  // FIXED
   if ((flags & MAP_FIXED) == MAP_FIXED) {
     if (check_va_free(curproc->mmaps, (uint)vstart, (uint)vend) == 0) {
       return (void*)-1;
@@ -144,33 +208,73 @@ sys_mmap(void) {
     }
   }
 
-  // TODO: not lazy alloc yet
-  int pagesz = PGROUNDUP(length) / PGSIZE;
-  int i;
-  for (i = 0; i < pagesz; i++) {
-    void* mem = kalloc();
-    if (mem == 0) {
-      --i;
-      break;
+  // ANONYMOUS
+  if (flags & MAP_ANONYMOUS) {
+    int pagesz = PGROUNDUP(length) / PGSIZE;
+   
+    for (int i = 0; i < pagesz; i++) {
+      void* mem = kalloc();
+      if (mem == 0) {
+        --i;
+        break;
+      }
+      memset(mem, 0, PGSIZE);
+
+      if (isshared) {
+        // from vm.c
+        if (mappages(curproc->pgdir, vstart + i * PGSIZE, PGSIZE, V2P(mem), PTE_W | PTE_U) < 0) {
+          // free allocated memory
+          kfree(mem);
+          while(--i > 0) {
+            void * curva = vstart + i * PGSIZE;
+            pte_t *pte = walkpgdir(curproc->pgdir, curva, 0);
+            if(pte && (*pte & PTE_P)) {
+              char *curpa = P2V(PTE_ADDR(*pte));
+              kfree(curpa);
+            }
+          }
+          return (void*)-1;
+        }
+      } else {
+        // TODO: handle private
+        // get pte, curva = faulting_va <- retrieve from page fault handler
+        // uint old_pa = PTE_ADDR(*pte);
+        // void *new_page = kalloc();
+        // if (new_page == 0) {
+        //     return -1;
+        // }
+
+        // Copy the contents of the old page to the new page
+        // memmove(new_page, P2V(old_pa), PGSIZE);
+
+        // .. update pte and invalidate tlb!
+      }
     }
-    memset(mem, 0, PGSIZE);
-    // from vm.c
-    if (mappages(curproc->pgdir, vstart + i * PGSIZE, PGSIZE, V2P(mem), PTE_W | PTE_U) < 0) {
-      break;
+  } else {
+    // file backed
+    struct file *f = curproc->ofile[fd];
+    filedup(f);
+
+    if (isshared) {
+      // TODO: edit file_backed_mmap!
+      // Directly map the file pages into the process's address space
+      if (file_backed_mmap(curproc, f, (uint)va, offset, prot) == -1) {
+        fileclose(f);
+        return (void*)-1;
+      }
+    } else { 
+      if (file_backed_private_mmap(curproc, f, (uint)va, offset, prot) == -1) {
+        fileclose(f);
+        return (void*)-1;
+      }
     }
-  } 
-  // alloc fail
-  if (i != pagesz){
-    cprintf("mmap alloc page fail %d / %d", i + 1, pagesz);
-    while(i >= 0) {
-      void * curva = vstart + i * PGSIZE;
-      pte_t *pte = walkpgdir(curproc->pgdir, curva, 0);
-      char *curpa = P2V(PTE_ADDR(*pte));
-      kfree(curpa);
-      --i;
-    }
-    return (void*)-1;
+
+    fileclose(f);
   }
+
+  // TODO: handle MAP_PRIVATE and MAP_GROWSUP
+  if (flags & MAP_GROWSUP) {}
+
 
   // Update new mapping info
   struct mmapinfo minfo;
@@ -182,132 +286,84 @@ sys_mmap(void) {
   minfo.fd = fd;
   minfo.offset = offset;
 
-  if ((flags & MAP_ANONYMOUS) != MAP_ANONYMOUS) {
-    filedup(curproc->ofile[fd]);
-  }
-  int inserti;
-  for (i = 0, inserti = 0; i < NMMAP; i++, inserti++) {
-    if (curproc->mmaps[i].valid) {
-      if (curproc->mmaps[i].va >= vstart)
+  int inserti = 0;
+  for (int i = 0; i < NMMAP; i++) {
+    if (!curproc->mmaps[i].valid || curproc->mmaps[i].va >= vstart) {
+        inserti = i;
         break;
     }
-    else break;
   }
   // insert
-  for (i = NMMAP - 2; i >= inserti; i--) {
-     memmove(&curproc->mmaps[i + 1], &curproc->mmaps[i], sizeof(struct mmapinfo)); 
-  }
-  memmove(&curproc->mmaps[inserti], &minfo, sizeof(struct mmapinfo)); 
-
-
-
-
-
-
-
-
-  // file-backed mapping
-  if (!(flags & MAP_ANONYMOUS)) {
-    // get file object
-    struct file *f = curproc->ofile[fd];
-    if(f==0)
-      return (void*) -1;
-
-    // get inode from file, calculate end of file position
-    ilock(f->ip);
-    uint fend; 
-    if (offset + length > f->ip->size)
-      fend = f->ip->size;
-    else 
-      fend = offset + length;
-
-    // lazy alloc
-    for (int j = 0; j < pagesz; j++) {
-      uint file_offset = offset + i* PGSIZE;
-      
-      if (file_offset < fend) {
-        if (mappages(curproc->pgdir, vstart + i * PGSIZE, PGSIZE, 0, PTE_W | PTE_U))
-          break;
-      }
-    }
-
-    iunlock(f->ip);
+  for (int i = NMMAP - 2; i >= inserti; i--) {
+    curproc->mmaps[i + 1] = curproc->mmaps[i];
   }
 
-  // handle page fault in trap.c
-
-  // handle MAP_PRIVATE and MAP_GROWSUP
-
-  if (flags & MAP_PRIVATE) {}
-  if (flags & MAP_GROWSUP) {}
-
-
+  // Insert new mapping
+  curproc->mmaps[inserti] = minfo;
  
+ return vstart;
+}
 
+int do_munmap(struct proc *curproc, void *addr, size_t length) {
+  if (length <= 0 || (uint)addr % PGSIZE != 0) {
+    return -1; 
+  }
 
-  if (flags & MAP_PRIVATE) {} (void*)vstart;
+  struct mmapinfo *mmaps = curproc->mmaps;
+  int i;
+  for (i = 0; i < NMMAP; i++) {
+    if (mmaps[i].valid && addr >= mmaps[i].va && addr < (mmaps[i].va + mmaps[i].length)) {
+      int unmapped_pages = 0;
+      int target_pages = PGROUNDUP(length) / PGSIZE;
+      void *va = addr;
+      while (unmapped_pages < target_pages) {
+        pte_t *pte = walkpgdir(curproc->pgdir, va, 0);
+        if (pte && *pte & PTE_P) {
+          char *pa = P2V(PTE_ADDR(*pte));
+          if (mmaps[i].flags & MAP_ANONYMOUS) {
+            // For anonymous mappings, no need to write back.
+            kfree(pa);
+          } else {
+            // For file-backed mappings, write back if necessary.
+            struct file *f = curproc->ofile[mmaps[i].fd];
+            if (mmaps[i].flags & MAP_SHARED) {
+              filewrite(f, pa, PGSIZE); // Handle partial write-backs and errors appropriately.
+            }
+            kfree(pa);
+          }
+          *pte = 0; // Invalidate the PTE.
+          // Consider flushing the TLB here if necessary.
+          va += PGSIZE; // Move to the next page.
+          unmapped_pages++;
+        } else {
+          // Handle the error appropriately if the PTE was expected to be present.
+          return -1;
+        }
+      }
+      // Invalidate the mapping info if the whole range has been unmapped.
+      if (va == (mmaps[i].va + mmaps[i].length)) {
+        mmaps[i].valid = 0;
+      }
+      return 0; // Success.
+    }
+  }
+
+  return -1; // Address not found in mappings.
 }
 
 // int munmap(void *addr, size_t length)
-int
-sys_munmap(void) {
-  int iva;
-  void* va;
-  int length;
-
+int sys_munmap(void) {
+  int iva, length;
   if (argint(0, &iva) < 0 || argint(1, &length) < 0) {
     return -1;
   }
 
-  va = (void*)iva;
+  void *va = (void*)iva;
   struct proc *curproc = myproc();
 
   if (length <= 0){
     return -1;
   }
 
-  struct mmapinfo *mmaps = curproc->mmaps;
-  struct file *f;
-  // TODO: only can unmap va == mmap.va
-  int i;
-  for (i = 0; i < NMMAP; i++) {
-    if (mmaps[i].valid && mmaps[i].va == va) {
-      void *map_start = mmaps[i].va;
-
-        if (length > mmaps[i].length) {
-          return -1;
-	      }
-
-        // get file to write back to
-        f = get_file(curproc, mmaps[i].fd);
-        if (f==0)
-          return -1;
-
-        int pagesz = PGROUNDUP(length) / PGSIZE;
-        int j;
-        for (j = 0; j < pagesz; j++) {
-          void * curva = va + j * PGSIZE;
-          pte_t *pte = walkpgdir(curproc->pgdir, curva, 0);
-
-          // if page dirty, write back to file
-          if (filewrite(f, P2V(PTE_ADDR(*pte)), PGSIZE) != PGSIZE) 
-            return -1;
-          
-          // free page
-          char *curpa = P2V(PTE_ADDR(*pte));
-          kfree(curpa);
-          *pte = 0;
-        }
-
-        // mark mapping as invalid
-        mmaps[i].valid = 0;
-        if (--f->ref == 0) 
-          fclose(f);
-
-        return 0;
-      
-    }
-  }
-
-  return -1;
+  return do_munmap(curproc, va, length);
 }

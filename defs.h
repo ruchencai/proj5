@@ -190,3 +190,7 @@ pte_t*		walkpgdir(pde_t *, const void *, int);
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+
+// sysmmap.c
+#include <stddef.h>
+int do_munmap(struct proc *, void *, size_t);

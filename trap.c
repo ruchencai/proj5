@@ -77,38 +77,38 @@ trap(struct trapframe *tf)
             cpuid(), tf->cs, tf->eip);
     lapiceoi();
     break;
-  case T_PGFLT: // TODO: page fault handling
-    char *fault_addr = (char *)rcr2();
-    struct proc *curproc = myproc();
+  // case T_PGFLT: // TODO: page fault handling
+  //   char *fault_addr = (char *)rcr2();
+  //   struct proc *curproc = myproc();
 
-    // determine if fault addr is w/i a file-backed mmap region
-    struct mmapinfo *region;
-    for (int i = 0; i<NMMAP; i++) {
-      struct mmapinfo *tmp = &curproc->mmaps[i];
+  //   // determine if fault addr is w/i a file-backed mmap region
+  //   struct mmapinfo *region;
+  //   for (int i = 0; i<NMMAP; i++) {
+  //     struct mmapinfo *tmp = &curproc->mmaps[i];
 
-      if (tmp->valid && fault_addr >= (char*)tmp->va && fault_addr < (char*)(tmp->va + tmp->length)) {
-        region = tmp;
-        break;
-      }
-    }
+  //     if (tmp->valid && fault_addr >= (char*)tmp->va && fault_addr < (char*)(tmp->va + tmp->length)) {
+  //       region = tmp;
+  //       break;
+  //     }
+  //   }
     
-    if (region) {
-      if (region->fd <0 || region->fd >= NOFILE) break;
-      struct file *f = curproc->ofile[region->fd];
+  //   if (region) {
+  //     if (region->fd <0 || region->fd >= NOFILE) break;
+  //     struct file *f = curproc->ofile[region->fd];
 
-      uint file_offset = region->offset + ((uint)fault_addr - (uint)region->va);
-      char *mem = kalloc();
-      if (!mem) {
-        curproc->killed = 1;
-        break;
-      }
+  //     uint file_offset = region->offset + ((uint)fault_addr - (uint)region->va);
+  //     char *mem = kalloc();
+  //     if (!mem) {
+  //       curproc->killed = 1;
+  //       break;
+  //     }
 
-      f->off = file_offset;
-      fileread(f, (char *)mem, PGSIZE);
-      mappages(curproc->pgdir, fault_addr, (void *)PGROUNDDOWN((uint)fault_addr), V2P(mem), PTE_W | PTE_U);
-      break;
-    }
-    break;
+  //     f->off = file_offset;
+  //     fileread(f, (char *)mem, PGSIZE);
+  //     mappages(curproc->pgdir, fault_addr, (void *)PGROUNDDOWN((uint)fault_addr), V2P(mem), PTE_W | PTE_U);
+  //     break;
+  //   }
+  //   break;
 
   //PAGEBREAK: 13
   default:
