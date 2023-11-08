@@ -26,6 +26,35 @@ tvinit(void)
   initlock(&tickslock, "time");
 }
 
+// helper function for handling age fault
+// page fault handler
+void handle_page_fault(struct trapframe *tf) {
+  uint va = rcr2();
+  struct proc *p = myproc();
+  pte_t *pte = walkpgdir(p->pgdir, (void*)va, 0);
+  if (pte == 0 || !(*pte & PTE_P)) {
+    // not a valid page table entry
+    cprintf("handle_page_fault: invalid page table entry\n");
+    exit();
+  }
+  if (*pte & PTE_U && !(*pte & PTE_W)) {
+    // read-only page
+    uint pa = PTE_ADDR(*pte);
+    char *mem = kalloc();
+    if (mem == 0) {
+      cprintf("handle_page_fault: out of memory\n");
+      exit();
+    }
+    memmove(mem, P2V(pa), PGSIZE);
+    *pte = V2P(mem) | PTE_U | PTE_W | PTE_P;
+    lcr3(V2P(p->pgdir));
+  } else {
+    // not a read-only page
+    cprintf("handle_page_fault: invalid page table entry\n");
+    exit();
+  }
+}
+
 void
 idtinit(void)
 {
@@ -77,38 +106,12 @@ trap(struct trapframe *tf)
             cpuid(), tf->cs, tf->eip);
     lapiceoi();
     break;
-  // case T_PGFLT: // TODO: page fault handling
-  //   char *fault_addr = (char *)rcr2();
-  //   struct proc *curproc = myproc();
-
-  //   // determine if fault addr is w/i a file-backed mmap region
-  //   struct mmapinfo *region;
-  //   for (int i = 0; i<NMMAP; i++) {
-  //     struct mmapinfo *tmp = &curproc->mmaps[i];
-
-  //     if (tmp->valid && fault_addr >= (char*)tmp->va && fault_addr < (char*)(tmp->va + tmp->length)) {
-  //       region = tmp;
-  //       break;
-  //     }
-  //   }
-    
-  //   if (region) {
-  //     if (region->fd <0 || region->fd >= NOFILE) break;
-  //     struct file *f = curproc->ofile[region->fd];
-
-  //     uint file_offset = region->offset + ((uint)fault_addr - (uint)region->va);
-  //     char *mem = kalloc();
-  //     if (!mem) {
-  //       curproc->killed = 1;
-  //       break;
-  //     }
-
-  //     f->off = file_offset;
-  //     fileread(f, (char *)mem, PGSIZE);
-  //     mappages(curproc->pgdir, fault_addr, (void *)PGROUNDDOWN((uint)fault_addr), V2P(mem), PTE_W | PTE_U);
-  //     break;
-  //   }
-  //   break;
+  case T_PGFLT: // TODO: page fault handling
+    // if (rcr2() >= MMAPBASE && rcr2() < KERNBASE) {
+    //   handle_page_fault(tf);
+    //   break;
+    // }
+    break;
 
   //PAGEBREAK: 13
   default:

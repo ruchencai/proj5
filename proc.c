@@ -221,6 +221,7 @@ fork(void)
     }
   }
 
+
   acquire(&ptable.lock);
 
   np->state = RUNNABLE;
@@ -251,6 +252,8 @@ exit(void)
       curproc->mmaps[i].valid = 0;
     }
   }
+
+
 
   // Close all open files.
   for(fd = 0; fd < NOFILE; fd++){
