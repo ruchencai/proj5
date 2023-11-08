@@ -194,3 +194,5 @@ pte_t*		walkpgdir(pde_t *, const void *, int);
 // sysmmap.c
 #include <stddef.h>
 int do_munmap(struct proc *, void *, size_t);
+void page_fault_handler(uint);
+void copy_mmaps(struct proc *, struct proc *);

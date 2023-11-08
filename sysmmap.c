@@ -16,7 +16,7 @@
 int 
 check_va_free(struct mmapinfo *mmaps, uint start_addr, uint end_addr) {
 
-  if (start_addr <= 0x60000000 || end_addr > KERNBASE) {
+  if (start_addr < 0x60000000 || end_addr > KERNBASE) {
     return 0;
   }
 
@@ -78,155 +78,230 @@ get_va_free(struct mmapinfo *mmaps, int length, void **start_addr, void **end_ad
   return 0;
 }
 
-// file-backed mapping, not lazy alloc!
-// int file_backed_mmap(struct proc *p, struct file *f, uint addr, int offset, int prot) {
-//   int remaining_size = f->ip->size - offset;  // Remaining size should consider the offset
-//   if (remaining_size <= 0) return -1;
-  
-//   // Allocate in the unit of pages
-//   for (int i = 0; i < remaining_size; i += PGSIZE) {
-//     // Calculate the size to map for this iteration
-//     int map_size = (remaining_size - i > PGSIZE) ? PGSIZE : (remaining_size - i);
+void record_mapping(struct proc * curproc, void* vstart, uint length, int prot, int flags, int fd, int offset) {
+    struct mmapinfo minfo;
+    minfo.va = vstart;
+    minfo.length = length;
+    minfo.prot = prot;
+    minfo.flags = flags;
+    minfo.valid = 1;
+    minfo.fd = fd;
+    minfo.offset = offset;
 
-//     // Allocate a page and clear it
-//     char *tmp = kalloc();
-//     if (!tmp)
-//       return -1;  
-//     memset(tmp, 0, PGSIZE);
+    int inserti = NMMAP; // Initialize to an invalid index.
 
-//     // Copy file content into the allocated page
-//     ilock(f->ip);  // Lock the inode before accessing the file
-
-//     int read_size = map_size;  // Amount of file content to read into the page
-//     int bytes_read = readi(f->ip, tmp, offset + i, read_size);  
-//     if (bytes_read < 0) {
-//       iunlock(f->ip);
-//       kfree(tmp);  
-//       return -1;
-//     }
-
-//     iunlock(f->ip);  
-
-//     // Map the page into the user proc
-//     if (mappages(p->pgdir, (void *)(addr + i), PGSIZE, V2P(tmp), prot) < 0) {
-//       kfree(tmp); 
-//       return -1;
-//     }
-
-//     remaining_size -= map_size;
-//   }
-
-//   return 0;  
-// }
-
-// file-backed memory mapping with private option
-int file_backed_private_mmap(struct proc *p, struct file *f, uint va, uint offset, uint prot) {
-  uint length = PGROUNDUP(f->ip->size - offset);
-  uint pagesz = length / PGSIZE;
-  uint vstart = PGROUNDDOWN(va);
-  //uint voff = va - vstart;
-
-  for (int i = 0; i < pagesz; i++) {
-    void *mem = kalloc();
-    if (mem == 0) {
-      return -1;
+    // find the insertion point
+    for (int i = 0; i < NMMAP; i++) {
+        if (!curproc->mmaps[i].valid) {
+            inserti = i;
+            break;
+        } else if (curproc->mmaps[i].va >= vstart) {
+            inserti = i;
+            break;
+        }
     }
-    memset(mem, 0, PGSIZE);
 
-    uint curva = vstart + i * PGSIZE;
-    pte_t *pte = walkpgdir(p->pgdir, (void*)curva, 1);
+    if (inserti == NMMAP) {
+        panic("Out of mmap slots");
+    }
+
+    // insert
+    for (int i = NMMAP - 2; i >= inserti; i--) {
+      curproc->mmaps[i + 1] = curproc->mmaps[i];
+    }
+
+    // Insert new mapping
+    curproc->mmaps[inserti] = minfo;
+}
+
+int fdalloc(struct file *f) {
+  struct proc *curproc = myproc();
+  for (int fd = 0; fd < NOFILE; fd++) {
+    if (curproc->ofile[fd] == 0) {
+      curproc->ofile[fd] = f;
+      f->ref++;
+      return fd;
+    }
+  }
+  return -1; // No free file descriptors
+}
+
+void * 
+file_backed_mmap(struct proc *p, struct file *f, uint addr, int offset, int prot, int ispriva, int flags, int fd) {
+  // Lock the inode to read file size safely.
+  ilock(f->ip);
+  int remaining_size = f->ip->size - offset; // size of the file after offset
+  iunlock(f->ip);
+  cprintf("f->ip->size: %d\n", f->ip->size);
+  cprintf("ispriva: %d\n", ispriva);
+
+  if (remaining_size <= 0) return (void *)-1;
+
+  // page-align the address
+  int length = PGROUNDUP(remaining_size);
+  addr = PGROUNDUP(addr);  
+
+  // find free address space in the process memory
+  void *vstart = (void *)addr;
+  void *vend = 0;
+  if (get_va_free(p->mmaps, length, &vstart, &vend) == 0) {
+    return (void *)-1;  // no free address space
+  }
+
+  // lazy allocate, not loading file contents yet
+  for (int i = 0; i < remaining_size; i += PGSIZE) {
+    // set pte with appropriate flags, if private, mark as copy-on-write
+    pte_t *pte = walkpgdir(p->pgdir, (void *)(vstart + i), 1);
     if (pte == 0) {
-      kfree(mem);
-      return -1;
-    }
-    if (*pte & PTE_P) {
-      // page already mapped, should not happen
-      kfree(mem);
-      return -1;
-    }
-    *pte = PTE_U | PTE_P;
-    //lcr3(V2P(p->pgdir));
-    asm volatile("movl %0,%%cr3" : : "r" (V2P(p->pgdir)));
-
-    if (f == 0 || f->readable == 0) {
-      return -1;
+      return (void *)-1; 
     }
 
-    if (readi(f->ip, mem, PGSIZE, offset + i * PGSIZE) != PGSIZE) {
-      kfree(mem);
-      return -1;
-    }
-
-    if (mappages(p->pgdir, (void*)curva, PGSIZE, V2P(mem), prot | PTE_W | PTE_U) < 0) {
-      kfree(mem);
-      return -1;
+    if (ispriva) {
+      // mark as read only innitially, when need to write, trigger page fault 
+      *pte = (*pte & ~PTE_W) | PTE_U;
+    } else {
+      // not private, set as specified
+      *pte = (*pte & ~0xFFF);
+       *pte |= PTE_U;
+        if (prot & PROT_WRITE) {
+            *pte |= PTE_W;
+        }
     }
   }
 
-  return 0;
+  filedup(f); // Increment the ref count
+
+  // Update new mapping info
+  record_mapping(p, vstart, length, prot, flags, fd, offset);
+cprintf("vstart: %x\n", vstart);
+cprintf("vend: %x\n", vend);
+char *mem = (char*) vstart;
+for (int i = 0; i < length; i++) {
+  cprintf("char at index: %d\n", i);
+        cprintf("%02hhx ", mem[i]);  // Print each byte in hex
+        if ((i + 1) % 16 == 0)  // After every 16 bytes, print a new line
+            cprintf("\n");
+    }
+    cprintf("\n");
+  return (void *)vstart;
+
+  // // Allocate mmapinfo in the process structure for the new memory mapping.
+  // struct mmapinfo *mi = 0;
+  // for (int i = 0; i < NMMAP; i++) {
+  //   if (!p->mmaps[i].valid) {
+  //     mi = &p->mmaps[i];
+  //     break;
+  //   }
+  // }
+  // if (mi == NULL) {
+  //   return (void *)-1;  // No space for new mapping.
+  // }
+
+  // // Setup the mmapinfo structure.
+  // mi->va = (char *)addr;
+  // mi->length = length;
+  // mi->prot = prot;
+  // mi->flags = ispriva ? MAP_PRIVATE : MAP_SHARED;
+  // mi->fd = fdalloc(f); // Increment the ref count of the file.
+  // if (mi->fd < 0) {
+  //   return (void *)-1;  // No free file descriptors
+  // }
+
+  // mi->offset = offset;
+  // mi->valid = 1;
+
 }
 
-// file-backed memory mapping with shared option
-int file_backed_mmap(struct proc *p, struct file *f, uint va, uint offset, uint prot) {
-  uint length = PGROUNDUP(f->ip->size - offset);
-  uint pagesz = length / PGSIZE;
-  uint vstart = PGROUNDDOWN(va);
-  //uint voff = va - vstart;
+// free pages for error handling
+void free_pages(struct proc *curproc, void *vstart, uint pgcount) {
+  uint i;
+  void *curva;
+  pte_t *pte;
+  char *curpa;
 
-  for (int i = 0; i < pagesz; i++) {
-    uint curva = vstart + i * PGSIZE;
-    pte_t *pte = walkpgdir(p->pgdir, (void*)curva, 1);
-    if (pte == 0) {
-      return -1;
-    }
-    if (*pte & PTE_P) {
-      // page already mapped, should not happen
-      return -1;
-    }
-    *pte = PTE_U | PTE_P;
-    // lcr3(V2P(p->pgdir));
-    asm volatile("movl %0,%%cr3" : : "r" (V2P(p->pgdir)));
-
-    if (mappages(p->pgdir, (void*)curva, PGSIZE, V2P(f->ip->addrs + offset + i * PGSIZE), prot | PTE_U) < 0) {
-      return -1;
+  for (i = 0; i < pgcount; i++) {
+    curva = vstart + i * PGSIZE;
+    pte = walkpgdir(curproc->pgdir, curva, 0);
+    if (pte != NULL && (*pte & PTE_P) != 0) {
+      curpa = P2V(PTE_ADDR(*pte));
+      kfree(curpa);
+      *pte = 0;
     }
   }
-
-  return 0;
 }
 
-// // page fault handler
-// void handle_page_fault(struct trapframe *tf) {
-//   uint va = rcr2();
-//   struct proc *p = myproc();
-//   pte_t *pte = walkpgdir(p->pgdir, (void*)va, 0);
-//   if (pte == 0 || !(*pte & PTE_P)) {
-//     // not a valid page table entry
-//     cprintf("handle_page_fault: invalid page table entry\n");
-//     exit();
-//   }
-//   if (*pte & PTE_COW || (*pte & PTE_U && !(*pte & PTE_W))) {
-//     // copy-on-write or read-only page
-//     uint pa = PTE_ADDR(*pte);
-//     char *mem = kalloc();
-//     if (mem == 0) {
-//       cprintf("handle_page_fault: out of memory\n");
-//       exit();
-//     }
-//     memmove(mem, P2V(pa), PGSIZE);
-//     *pte = V2P(mem) | PTE_U | PTE_W | PTE_P;
-//     lcr3(V2P(p->pgdir));
-//   } else {
-//     // not a copy-on-write or read-only page
-//     cprintf("handle_page_fault: invalid page table entry\n");
-//     exit();
-//   }
-// }
+void *handle_error(struct proc *curproc, void *mem, void *vstart, uint pgcount) {
+  kfree(mem);
+  free_pages(curproc, vstart, pgcount);
+  return (void*)-1;
+}
 
+void inc_ref_count(char *pa) {
+  pte_t *pte = walkpgdir(myproc()->pgdir, pa, 0);
+  if (pte && (*pte & PTE_P)) {
+    (*pte)++; // increment ref count
+  }
+}
 
-// TODO: implement copy_map function to copy from parent to child here. only call this function in fork
+// get ref count of a page
+int ref_count(char *pa) {
+  pte_t *pte = walkpgdir(myproc()->pgdir, pa, 0);
+  if (pte && (*pte & PTE_P)) {
+    return *pte;
+  }
+  return -1;
+}
 
-	
+void dec_ref_count(char *pa) {
+  pte_t *pte = walkpgdir(myproc()->pgdir, pa, 0);
+  if (pte && (*pte & PTE_P)) {
+    (*pte)--; // decrement ref count
+  }
+}
+
+// helper function for copy from parent to child in fork()
+void copy_mmaps(struct proc *parent, struct proc *child) {
+
+  for (int i = 0; i < NMMAP; i++) {
+    if (parent->mmaps[i].valid) {
+      // copy the mmapinfo struct
+      child->mmaps[i] = parent->mmaps[i];
+
+      // if private, set as copy-on-write
+      if (parent->mmaps[i].flags & MAP_PRIVATE) {
+        for (uint j = 0; j < child->mmaps[i].length; j += PGSIZE) {
+          uint va = (uint)child->mmaps[i].va + j;
+
+          // Find the page table entry for the virtual address
+          pte_t *pte = walkpgdir(parent->pgdir, (void *)va, 0);
+          if (pte && (*pte & PTE_P)) {
+            // Mark the parent's page as read-only
+            *pte &= ~PTE_W;
+            // Update the PTE in both parent and child's page tables
+            pte_t *child_pte = walkpgdir(child->pgdir, (void *)va, 1);
+            if (child_pte) {
+              *child_pte = *pte;
+            }
+          }
+        }
+        // page fault will be caused when attempting to write
+      } else {
+        // if shared, increment the ref count of the file and copy as they are
+        //filedup(child->ofile[child->mmaps[i].fd]);
+        for (uint j = 0; j < parent->mmaps[i].length; j += PGSIZE) {
+          uint va = (uint)parent->mmaps[i].va + j;
+          pte_t *pte = walkpgdir(parent->pgdir, (void *)va, 0);
+          if (pte && (*pte & PTE_P)) {
+            // increment ref count of the page
+            char *pa = P2V(PTE_ADDR(*pte));
+            inc_ref_count(pa);
+          }
+        }
+      }
+    }
+  }
+}
+
 
 // void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 void *
@@ -267,7 +342,6 @@ sys_mmap(void) {
     return (void*)-1;
   }
 
-  // TODO: alloc mmaps 
   if (curproc->mmaps[NMMAP - 1].valid) {
     return (void*)-1;
   }
@@ -301,103 +375,31 @@ sys_mmap(void) {
 
       if (isshared) {
         // from vm.c
-        if (mappages(curproc->pgdir, vstart + i * PGSIZE, PGSIZE, V2P(mem), PTE_W | PTE_U) < 0) {
-          // free allocated memory
-          kfree(mem);
-          while(--i > 0) {
-            void * curva = vstart + i * PGSIZE;
-            pte_t *pte = walkpgdir(curproc->pgdir, curva, 0);
-            if(pte && (*pte & PTE_P)) {
-              char *curpa = P2V(PTE_ADDR(*pte));
-              kfree(curpa);
-            }
-          }
-          return (void*)-1;
-        }
+        if (mappages(curproc->pgdir, vstart + i * PGSIZE, PGSIZE, V2P(mem), PTE_W | PTE_U) < 0)
+          return handle_error(curproc, mem, vstart, i);
       } else {
-        // TODO: handle private with COW
-        void *curva = vstart + i * PGSIZE;
-        pte_t *pte = walkpgdir(curproc->pgdir, curva, 1);
-        if (pte == 0) {
-          kfree(mem);
-          while(--i > 0) {
-            void * curva = vstart + i * PGSIZE;
-            pte_t *pte = walkpgdir(curproc->pgdir, curva, 0);
-            if(pte && (*pte & PTE_P)) {
-              char *curpa = P2V(PTE_ADDR(*pte));
-              kfree(curpa);
-            }
-          }
-          return (void*)-1;
-        }
-        if (*pte & PTE_P) {
-          // page already mapped, should not happen
-          kfree(mem);
-          while(--i > 0) {
-            void * curva = vstart + i * PGSIZE;
-            pte_t *pte = walkpgdir(curproc->pgdir, curva, 0);
-            if(pte && (*pte & PTE_P)) {
-              char *curpa = P2V(PTE_ADDR(*pte));
-              kfree(curpa);
-            }
-          }
-          return (void*)-1;
-        }
-        *pte = PTE_U | PTE_P;
-        // lcr3(V2P(curproc->pgdir));
+        // implement private
+        if (mappages(curproc->pgdir, vstart + i * PGSIZE, PGSIZE, V2P(mem), PTE_W | PTE_U | PTE_P) < 0)
+          return handle_error(curproc, mem, vstart, i);
       }
     }
+
+    // Update new mapping info
+    record_mapping(curproc, vstart, length, prot, flags, fd, offset);
+
+    return vstart;
   } else {
     // file backed
     struct file *f = curproc->ofile[fd];
-    filedup(f);
-
-    if (isshared) {
-      // TODO: edit file_backed_mmap!
-      // Directly map the file pages into the process's address space
-      if (file_backed_mmap(curproc, f, (uint)va, offset, prot) == -1) {
-        fileclose(f);
-        return (void*)-1;
-      }
-    } else { 
-      if (file_backed_private_mmap(curproc, f, (uint)va, offset, prot) == -1) {
-        fileclose(f);
-        return (void*)-1;
-      }
+    if (f == 0) {
+      return (void*)-1;
     }
+
+    vstart = file_backed_mmap(curproc, f, (uint)va, offset, prot, ispriva, flags, fd);
 
     fileclose(f);
   }
 
-  // TODO: handle MAP_PRIVATE and MAP_GROWSUP
-  if (flags & MAP_GROWSUP) {}
-
-
-  // Update new mapping info
-  struct mmapinfo minfo;
-  minfo.va = vstart;
-  minfo.length = length;
-  minfo.prot = prot;
-  minfo.flags = flags;
-  minfo.valid = 1;
-  minfo.fd = fd;
-  minfo.offset = offset;
-
-  int inserti = 0;
-  for (int i = 0; i < NMMAP; i++) {
-    if (!curproc->mmaps[i].valid || curproc->mmaps[i].va >= vstart) {
-        inserti = i;
-        break;
-    }
-  }
-  // insert
-  for (int i = NMMAP - 2; i >= inserti; i--) {
-    curproc->mmaps[i + 1] = curproc->mmaps[i];
-  }
-
-  // Insert new mapping
-  curproc->mmaps[inserti] = minfo;
- 
  return vstart;
 }
 
@@ -413,34 +415,39 @@ int do_munmap(struct proc *curproc, void *addr, size_t length) {
       int unmapped_pages = 0;
       int target_pages = PGROUNDUP(length) / PGSIZE;
       void *va = addr;
+
       while (unmapped_pages < target_pages) {
         pte_t *pte = walkpgdir(curproc->pgdir, va, 0);
         if (pte && *pte & PTE_P) {
           char *pa = P2V(PTE_ADDR(*pte));
-          if (mmaps[i].flags & MAP_ANONYMOUS) {
-            // For anonymous mappings, no need to write back.
+          if (mmaps[i].flags & MAP_ANONYMOUS) { 
             kfree(pa);
           } else {
-            // For file-backed mappings, write back if necessary.
+            // filebacked -> write back to file
             struct file *f = curproc->ofile[mmaps[i].fd];
-            if (mmaps[i].flags & MAP_SHARED) {
-              filewrite(f, pa, PGSIZE); // Handle partial write-backs and errors appropriately.
+            
+            if (mmaps[i].flags & MAP_SHARED) { 
+              if (*pte & PTE_W) {
+                // write back to file if modified
+                filewrite(f, pa, PGSIZE);
+              }
+            } else if (mmaps[i].flags & MAP_PRIVATE) { // dont write back
+              kfree(pa);
             }
-            kfree(pa);
           }
-          *pte = 0; // Invalidate the PTE.
-          // Consider flushing the TLB here if necessary.
-          va += PGSIZE; // Move to the next page.
-          unmapped_pages++;
+          *pte = 0; 
+          
+          va += PGSIZE; // move to the next page
+          unmapped_pages++; 
         } else {
-          // Handle the error appropriately if the PTE was expected to be present.
           return -1;
         }
       }
-      // Invalidate the mapping info if the whole range has been unmapped.
-      if (va == (mmaps[i].va + mmaps[i].length)) {
+      // invalidate the mapping info if the whole range has been unmapped
+      if ((uint)va == ((uint)mmaps[i].va + PGROUNDUP(mmaps[i].length))) {
         mmaps[i].valid = 0;
       }
+
       return 0; 
     }
   }
@@ -450,6 +457,7 @@ int do_munmap(struct proc *curproc, void *addr, size_t length) {
 
 // int munmap(void *addr, size_t length)
 int sys_munmap(void) {
+
   int iva, length;
   if (argint(0, &iva) < 0 || argint(1, &length) < 0) {
     return -1;
@@ -463,4 +471,155 @@ int sys_munmap(void) {
   }
 
   return do_munmap(curproc, va, length);
+}
+
+struct mmapinfo* find_mapping(struct proc *curproc, uint faulting_address) {
+   
+    for (int i = 0; i < NMMAP; i++) {
+      cprintf("curproc->mmaps[i].va: %d\n", curproc->mmaps[i].va);
+      cprintf("curproc->mmaps[i].length: %d\n", curproc->mmaps[i].length);
+      cprintf("faulting_address: %d\n", faulting_address);
+        if (curproc->mmaps[i].valid) {
+            uint start = (uint)curproc->mmaps[i].va;
+            uint end = start + curproc->mmaps[i].length;
+            if (faulting_address >= start && faulting_address < end) {
+              cprintf("&curproc->mmaps[i]: %x\n", &curproc->mmaps[i]);
+                return &curproc->mmaps[i]; // found the mapping with the faulting address
+            }
+        }
+    }
+    return NULL; 
+}
+
+void
+page_fault_handler(uint page_fault_addr) {
+  struct proc *curproc = myproc();
+
+  if (curproc == 0) 
+    return;
+
+  if (page_fault_addr < 0x60000000 || page_fault_addr > KERNBASE) {
+    goto segfault;
+  }
+
+  // check if the faulting address is within a cow region
+  cprintf("page fault address: %x\n", page_fault_addr);
+  struct mmapinfo *mi = find_mapping(curproc, page_fault_addr);
+  cprintf("mi: %x\n", mi);
+  if (mi && (mi->flags & MAP_PRIVATE)) {
+    // allocate a new page in cow region
+    char *mem1 = kalloc();
+    if (!mem1) {
+      panic("Out of memory");
+    }
+
+    // get original page
+    pte_t *pte = walkpgdir(curproc->pgdir, (void *)page_fault_addr, 0);
+    if (!pte) {
+      panic("Page table entry not found, COW page fault");
+    }
+    char *original_page = P2V(PTE_ADDR(*pte));
+
+    // copy the original page to the new page
+    memmove(mem1, original_page, PGSIZE);
+
+    // map the new page to the faulting address
+    if (mappages(curproc->pgdir, (void *)page_fault_addr, PGSIZE, V2P(mem1), PTE_W | PTE_U) < 0) {
+      panic("mappages failed, COW page fault");
+    }
+
+    // decrease the ref count of the original page if necessary
+    if (ref_count(original_page) == 1) {
+      kfree(original_page);
+    } else {
+      dec_ref_count(original_page);
+    }
+  } 
+
+  // handles growsup
+  void *mem;
+  struct mmapinfo *mmaps = curproc->mmaps;
+  for (int i = 0; i < NMMAP; i++) {
+    if (mmaps[i].valid && ((mmaps[i].flags & MAP_PRIVATE) == MAP_PRIVATE)) {
+      uint map_start = (uint)mmaps[i].va;
+      uint map_end = PGROUNDUP((uint)mmaps[i].va + mmaps[i].length);
+      if (page_fault_addr >= map_start && page_fault_addr < map_end) {
+        uint offset = page_fault_addr - map_start;
+        uint page_index = offset / PGSIZE;
+        uint page_offset = offset % PGSIZE;
+        uint page_addr = map_start + page_index * PGSIZE;
+        pte_t *pte = walkpgdir(curproc->pgdir, (void *)page_addr, 0);
+        if (pte == 0) {
+          goto segfault;
+        }
+        if ((*pte & PTE_P) == 0) {
+          goto segfault;
+        }
+        if ((*pte & PTE_W) == 0) {
+          // copy on write
+          mem = kalloc();
+          if (mem == 0) {
+            cprintf("kalloc failed\n");
+            curproc->killed = 1;
+            return;
+          }
+          memset(mem, 0, PGSIZE);
+          memmove(mem, (void *)(P2V(PTE_ADDR(*pte)) + page_offset), PGSIZE - page_offset);
+          if (mappages(curproc->pgdir, (void *)page_addr, PGSIZE, V2P(mem), PTE_W | PTE_U) < 0) {
+            kfree(mem);
+            cprintf("mmappages failed\n");
+            curproc->killed = 1;
+            return;
+          }
+          return;
+        }
+        else {
+          goto segfault;
+        }
+      }
+    }
+  }
+
+
+  int i, growsup_index = -1;
+  // check if it's protect page
+  for (i = 0; i < NMMAP; i++) {
+    if (mmaps[i].valid && ((mmaps[i].flags & MAP_GROWSUP) == MAP_GROWSUP)) {
+      uint map_end = PGROUNDUP((uint)mmaps[i].va + mmaps[i].length);
+      // growsup and have one page left
+      if (page_fault_addr >= map_end && page_fault_addr < map_end + PGSIZE 
+        && (((i + 1 == NMMAP || mmaps[i + 1].valid == 0) && map_end + PGSIZE < KERNBASE) || (map_end + PGSIZE < (uint)mmaps[i + 1].va))) {
+        growsup_index = i;
+	break;
+      }
+    }
+  }
+
+  if (growsup_index >= 0) 
+    goto growsup;
+  else 
+    goto segfault;
+
+growsup:
+  mem = kalloc();
+  if (mem == 0) {
+    cprintf("kalloc failed\n");
+    curproc->killed = 1;
+    return;
+  }
+  memset(mem, 0, PGSIZE);
+  if (mappages(curproc->pgdir, mmaps[growsup_index].va + PGROUNDUP(mmaps[growsup_index].length),
+      PGSIZE, V2P(mem), PTE_W | PTE_U) < 0) {
+    kfree(mem);
+    cprintf("mmappages failed\n");
+    curproc->killed = 1;
+    return;
+  }
+  mmaps[growsup_index].length += PGSIZE; 
+  return;
+
+segfault:
+  cprintf("Segmentation Fault\n");
+  curproc->killed = 1;
+  return;
 }

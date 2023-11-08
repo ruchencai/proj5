@@ -209,18 +209,12 @@ fork(void)
       np->ofile[i] = filedup(curproc->ofile[i]);
   np->cwd = idup(curproc->cwd);
 
+  // Copy the mmap information from the parent to the child.
+  copy_mmaps(curproc, np);
+
   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
 
   pid = np->pid;
-
-  // copy mmap from parent to the child
-  for (int i = 0; i < NMMAP; i++) {
-    if (curproc->mmaps[i].valid) {
-      // duplicate if valid
-      np->mmaps[i] = curproc->mmaps[i];
-    }
-  }
-
 
   acquire(&ptable.lock);
 
@@ -252,8 +246,6 @@ exit(void)
       curproc->mmaps[i].valid = 0;
     }
   }
-
-
 
   // Close all open files.
   for(fd = 0; fd < NOFILE; fd++){

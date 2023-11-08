@@ -26,35 +26,6 @@ tvinit(void)
   initlock(&tickslock, "time");
 }
 
-// helper function for handling age fault
-// page fault handler
-void handle_page_fault(struct trapframe *tf) {
-  uint va = rcr2();
-  struct proc *p = myproc();
-  pte_t *pte = walkpgdir(p->pgdir, (void*)va, 0);
-  if (pte == 0 || !(*pte & PTE_P)) {
-    // not a valid page table entry
-    cprintf("handle_page_fault: invalid page table entry\n");
-    exit();
-  }
-  if (*pte & PTE_U && !(*pte & PTE_W)) {
-    // read-only page
-    uint pa = PTE_ADDR(*pte);
-    char *mem = kalloc();
-    if (mem == 0) {
-      cprintf("handle_page_fault: out of memory\n");
-      exit();
-    }
-    memmove(mem, P2V(pa), PGSIZE);
-    *pte = V2P(mem) | PTE_U | PTE_W | PTE_P;
-    lcr3(V2P(p->pgdir));
-  } else {
-    // not a read-only page
-    cprintf("handle_page_fault: invalid page table entry\n");
-    exit();
-  }
-}
-
 void
 idtinit(void)
 {
@@ -106,11 +77,9 @@ trap(struct trapframe *tf)
             cpuid(), tf->cs, tf->eip);
     lapiceoi();
     break;
-  case T_PGFLT: // TODO: page fault handling
-    // if (rcr2() >= MMAPBASE && rcr2() < KERNBASE) {
-    //   handle_page_fault(tf);
-    //   break;
-    // }
+  //PAGEBREAK: 14 access mem without alloc
+  case 14:
+    page_fault_handler(rcr2());
     break;
 
   //PAGEBREAK: 13
