@@ -152,6 +152,7 @@ file_backed_mmap(struct proc *p, struct file *f, uint addr, int offset, int prot
   for (int i = 0; i < remaining_size; i += PGSIZE) {
     // set pte with appropriate flags, if private, mark as copy-on-write
     pte_t *pte = walkpgdir(p->pgdir, (void *)(vstart + i), 1);
+    cprintf("address passed in pte creation: %x\n", (void *)(vstart + i));
     if (pte == 0) {
       return (void *)-1; 
     }
@@ -175,14 +176,8 @@ file_backed_mmap(struct proc *p, struct file *f, uint addr, int offset, int prot
   record_mapping(p, vstart, length, prot, flags, fd, offset);
 cprintf("vstart: %x\n", vstart);
 cprintf("vend: %x\n", vend);
-char *mem = (char*) vstart;
-for (int i = 0; i < length; i++) {
-  cprintf("char at index: %d\n", i);
-        cprintf("%02hhx ", mem[i]);  // Print each byte in hex
-        if ((i + 1) % 16 == 0)  // After every 16 bytes, print a new line
-            cprintf("\n");
-    }
-    cprintf("\n");
+cprintf("length: %d\n", length);
+
   return (void *)vstart;
 
   // // Allocate mmapinfo in the process structure for the new memory mapping.
@@ -261,46 +256,59 @@ void dec_ref_count(char *pa) {
 
 // helper function for copy from parent to child in fork()
 void copy_mmaps(struct proc *parent, struct proc *child) {
-
   for (int i = 0; i < NMMAP; i++) {
     if (parent->mmaps[i].valid) {
       // copy the mmapinfo struct
       child->mmaps[i] = parent->mmaps[i];
 
-      // if private, set as copy-on-write
       if (parent->mmaps[i].flags & MAP_PRIVATE) {
         for (uint j = 0; j < child->mmaps[i].length; j += PGSIZE) {
           uint va = (uint)child->mmaps[i].va + j;
 
-          // Find the page table entry for the virtual address
-          pte_t *pte = walkpgdir(parent->pgdir, (void *)va, 0);
-          if (pte && (*pte & PTE_P)) {
+          // Ensure the child's PTE is created.
+          pte_t *child_pte = walkpgdir(child->pgdir, (void *)va, 1);
+          if (!child_pte) {
+            panic("copy_mmaps: walkpgdir failed to create child pte");
+          }
+
+          // Find the parent's page table entry for the virtual address
+          pte_t *parent_pte = walkpgdir(parent->pgdir, (void *)va, 0);
+          if (parent_pte && (*parent_pte & PTE_P)) {
+            // Allocate a new page for the child and copy the content.
+            char *mem = kalloc();
+            memmove(mem, (char*)P2V(PTE_ADDR(*parent_pte)), PGSIZE);
+            // Link to the new physical page in the child's PTE.
+            *child_pte = V2P(mem) | PTE_FLAGS(*parent_pte);
             // Mark the parent's page as read-only
-            *pte &= ~PTE_W;
-            // Update the PTE in both parent and child's page tables
-            pte_t *child_pte = walkpgdir(child->pgdir, (void *)va, 1);
-            if (child_pte) {
-              *child_pte = *pte;
-            }
+            *parent_pte &= ~PTE_W;
+            // Invalidate the parent's TLB entry for this page
+            clearpteu(parent->pgdir, (void*)va);
+          } else {
+            // Handle case where parent PTE does not exist.
           }
         }
-        // page fault will be caused when attempting to write
+        // Parent and child share the page until a write occurs.
       } else {
-        // if shared, increment the ref count of the file and copy as they are
-        //filedup(child->ofile[child->mmaps[i].fd]);
+        // For shared mappings, just increase the reference count.
         for (uint j = 0; j < parent->mmaps[i].length; j += PGSIZE) {
           uint va = (uint)parent->mmaps[i].va + j;
           pte_t *pte = walkpgdir(parent->pgdir, (void *)va, 0);
           if (pte && (*pte & PTE_P)) {
-            // increment ref count of the page
             char *pa = P2V(PTE_ADDR(*pte));
             inc_ref_count(pa);
+            // You may also need to create the PTE for the child.
+            pte_t *child_pte = walkpgdir(child->pgdir, (void *)va, 1);
+            if (!child_pte) {
+              panic("copy_mmaps: walkpgdir failed to create child pte for shared mapping");
+            }
+            *child_pte = *pte; // Share the physical page.
           }
         }
       }
     }
   }
 }
+
 
 
 // void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
@@ -503,9 +511,13 @@ page_fault_handler(uint page_fault_addr) {
   }
 
   // check if the faulting address is within a cow region
-  cprintf("page fault address: %x\n", page_fault_addr);
   struct mmapinfo *mi = find_mapping(curproc, page_fault_addr);
+
+  cprintf("page fault address: %x\n", page_fault_addr);
   cprintf("mi: %x\n", mi);
+  cprintf("mi->flags: %d\n", mi->flags);
+  cprintf("mi->va: %x\n", mi->va);
+
   if (mi && (mi->flags & MAP_PRIVATE)) {
     // allocate a new page in cow region
     char *mem1 = kalloc();
@@ -524,7 +536,8 @@ page_fault_handler(uint page_fault_addr) {
     memmove(mem1, original_page, PGSIZE);
 
     // map the new page to the faulting address
-    if (mappages(curproc->pgdir, (void *)page_fault_addr, PGSIZE, V2P(mem1), PTE_W | PTE_U) < 0) {
+    if (mappages(curproc->pgdir, (void *)PGROUNDDOWN(page_fault_addr), PGSIZE, V2P(mem1), PTE_W | PTE_U) < 0) {
+      kfree(mem1);
       panic("mappages failed, COW page fault");
     }
 
@@ -534,7 +547,33 @@ page_fault_handler(uint page_fault_addr) {
     } else {
       dec_ref_count(original_page);
     }
-  } 
+
+    asm volatile("invlpg (%0)" : : "r" ((void*)page_fault_addr) : "memory");
+
+    return;
+  } else {
+    // shared, alloc by reading page from file
+    pte_t *pte = walkpgdir(curproc->pgdir, (void *)mi->va, 0);
+    if (!pte) {
+      panic("Page table entry not found");
+    }
+    
+    uint pa = PTE_ADDR(*pte);
+    char *mem = kalloc();
+        if (!mem)
+        {
+            panic("Out of memory");
+        }
+    memmove(mem, P2V(PTE_ADDR(*pte)), PGSIZE);
+
+    // map the page to the faulting address
+    if (mappages(curproc->pgdir, (void*)PGROUNDDOWN(page_fault_addr), PGSIZE, pa, PTE_FLAGS(*pte)) < 0) {
+      panic("mappages failed in MAP_SHARED");
+    }
+
+    return;
+  }
+
 
   // handles growsup
   void *mem;
